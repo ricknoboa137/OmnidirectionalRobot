@@ -17,9 +17,9 @@ WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-const uint8_t encPinA1 = 12, encPinA2 = 14, encPinB1 = 27, encPinB2 = 26, encPinC1 = 25, encPinC2 = 33;
+const uint8_t encPinA1 = 13, encPinA2 = 14, encPinB1 = 27, encPinB2 = 26, encPinC1 = 25, encPinC2 = 33;
 const uint8_t motorFrwdA = 22, motorBkwdA = 23, motorFrwdB = 18, motorBkwdB = 19, motorFrwdC = 17, motorBkwdC = 5;
-
+const uint8_t ledPin = 2;
 volatile long Encodervalue=0, LastEncodervalue=0, DeltaEncodervalue=0;
 volatile long EncodervalueA=0, LastEncodervalueA=0, DeltaEncodervalueA=0;
 volatile long EncodervalueB=0, LastEncodervalueB=0, DeltaEncodervalueB=0;
@@ -31,10 +31,11 @@ float velVect[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
 float velVectA[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
 float velVectB[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
 float velVectC[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
-int filterNumber =15;
+int filterNumber =10;
 int cont = 0;
-int numTicks =5;
-int sampleTime = 5;
+int internetConnected =0, mqttConnected =0;
+volatile unsigned prevLedTime=0, currLedTime=0;
+int sampleTime = 5, ledChk=0;;
 int N = 692; // ticks per rev 
 float diam = 6.5, velA, velB, velC;
 double freqA=0;
@@ -44,7 +45,7 @@ double Setpoint, Input, Output;
 double SetpointB, InputB, OutputB;
 double SetpointC, InputC, OutputC;
 double absSetpointA, absSetpointB, absSetpointC;
-double Kp=2.25, Ki= 4.8, Kd=0.88;
+double Kp=1.3, Ki= 7, Kd=0.051;
 PID myPID(&Input, &Output, &absSetpointA, Kp, Ki, Kd, DIRECT);
 PID myPIDB(&InputB, &OutputB, &absSetpointB, Kp, Ki, Kd, DIRECT);
 PID myPIDC(&InputC, &OutputC, &absSetpointC, Kp, Ki, Kd, DIRECT);
@@ -72,6 +73,20 @@ void IRAM_ATTR isrC() {
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
+    pinMode(motorFrwdA, OUTPUT);
+    pinMode(motorBkwdA, OUTPUT);
+    pinMode(motorFrwdB, OUTPUT);
+    pinMode(motorBkwdB, OUTPUT);
+    pinMode(motorFrwdC, OUTPUT);
+    pinMode(motorBkwdC, OUTPUT);
+    pinMode(ledPin, OUTPUT);
+    analogWrite(motorFrwdA, 0);
+    analogWrite(motorBkwdA, 0);
+    analogWrite(motorFrwdB, 0);
+    analogWrite(motorBkwdB, 0);
+    analogWrite(motorFrwdC, 0);
+    analogWrite(motorBkwdC, 0);
+    LedStatus();
     //WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
     Serial.begin(115200);
     // reset settings - wipe stored credentials for testing
@@ -95,14 +110,15 @@ void setup() {
     res = wm.autoConnect("Motor_Driver"); // password protected ap ,"password"
 
     if(!res) {
+        internetConnected = 0;
         Serial.println("Failed to connect");
         // ESP.restart();
     } 
     else {
         //if you get here you have connected to the WiFi    
         Serial.println("connected...yeey :):):)");
-        reconnect(); //connect MQTT
-        
+        internetConnected = 1;
+        reconnect(); //connect MQTT        
     }
     client.subscribe("motor_velocities");
     pinMode(encPinA1, INPUT_PULLUP);
@@ -120,21 +136,9 @@ void setup() {
     attachInterrupt(encPinA1, isrA, RISING);
     attachInterrupt(encPinB1, isrB, RISING);
     attachInterrupt(encPinC1, isrC, RISING);
-    pinMode(motorFrwdA, OUTPUT);
-    pinMode(motorBkwdA, OUTPUT);
-    pinMode(motorFrwdB, OUTPUT);
-    pinMode(motorBkwdB, OUTPUT);
-    pinMode(motorFrwdC, OUTPUT);
-    pinMode(motorBkwdC, OUTPUT);
-    analogWrite(motorFrwdA, 0);
-    analogWrite(motorBkwdA, 0);
-    analogWrite(motorFrwdB, 0);
-    analogWrite(motorBkwdB, 0);
-    analogWrite(motorFrwdC, 0);
-    analogWrite(motorBkwdC, 0);
-
+    prevLedTime = millis();
     currSampTimeA = millis();
-    Setpoint = 0;
+    //Setpoint = 0;
     myPID.SetMode(AUTOMATIC);
     myPIDB.SetMode(AUTOMATIC);
     myPIDC.SetMode(AUTOMATIC);
@@ -145,20 +149,33 @@ void setup() {
 
 void loop() {
     // put your main code here, to run repeatedly:  
+  if ((WiFi.status() != WL_CONNECTED) || (WiFi.localIP().toString() == "0.0.0.0")) {
+    internetConnected =0;
+    Serial.println("ROUTER DISCONNECTED !!!!");
+  }
+  else{
+    internetConnected =1;
+  }
 
   if (!client.connected()) {
     reconnect();
   }
   client.loop();
+  
+  if (millis()-currLedTime >= 330)
+ {
+    LedStatus();
+    currLedTime=millis();
+ }
  if (millis()-currSampTimeA >= sampleTime)
  {
   
   velA = CalcVelocity(1);
-  velB = CalcVelocity(2);
-  velC = CalcVelocity(3);
   currSampTimeA = millis();
+  velB = CalcVelocity(2);
   currSampTimeB = millis();
-  currSampTimeC = millis();
+  velC = CalcVelocity(3);
+  currSampTimeC = millis();  
   Input = abs(velA);
   InputB = abs(velB);
   InputC = abs(velC);
@@ -166,30 +183,12 @@ void loop() {
   myPIDB.Compute();
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
-  Serial.print(velA);
-  Serial.print(","); 
-  Serial.print(Setpoint);
-  Serial.print(",");
-  Serial.print(Output/10);
-  Serial.print(",");
-  Serial.print(velB);
-  Serial.print(","); 
-  Serial.print(SetpointB);
-  Serial.print(",");
-  Serial.print(OutputB/10);
-  Serial.print(",");
-  Serial.print(velC);
-  Serial.print(","); 
-  Serial.print(SetpointC);
-  Serial.print(",");
-  Serial.print(OutputC/10);
-  Serial.println(",");
+  //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
+  //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
+  //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
   //Serial.println(vA);
-
+  //Serial.print(internetConnected);Serial.print(" , ");Serial.println(mqttConnected);
  }
-  
-  
-
 }
 
 
@@ -217,12 +216,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived on topic: ");
   Serial.println(topic);
   Serial.print("Message: ");
-  char message[20];
+  //String inMessage;
+  char message[11]="";
   for (int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
+    //inMessage+=(char)payload[i];
     message[i]=(char)payload[i];
   }
   Serial.println("");
+  //inMessage.toCharArray(message, inMessage.length() + 1);
   byte index = 0;
   ptr = strtok(message, ",");  // delimiter
   while (ptr != NULL)
@@ -251,39 +253,45 @@ void reconnect() {
 
   // Stop if already connected.
   if (client.connected()) {
+    mqttConnected = 1;
     return;
   }
 
   Serial.print("Connecting to MQTT... ");
 
-  uint8_t retries = 5;
-  while (!client.connected()) { // connect will return 0 for connected
+  uint8_t retries = 15;
+  while (!client.connected()) {// connect will return 0 for connected
+         
        if (client.connect("ESP32_clientID")) {
+          mqttConnected = 1;
+          LedStatus();
           Serial.println("connected");
           // Once connected, publish an announcement...
-          client.publish("outTopic", "MotorDriver connected to MQTT");
+          client.publish("DriverCheck", "OK");
           // ... and resubscribe
           client.subscribe("motor_velocities");
         }
         else {
+          mqttConnected = 0;
           Serial.println("Retrying MQTT connection in 2 seconds...");
-          delay(2000);  // wait 2 seconds
+          LedStatus();
+          delay(500);  // wait 2 seconds         
           retries--;
           if (retries == 0) {
             // basically die and wait for WDT to reset me
             //wm.resetSettings();
             break;
-          }
-        
-        }
-       
-  }  
+          }        
+        }       
+      }     
   if (!client.connected()) {
-      Serial.println("Failed to connect MQTT - restarting ESP!");
+      Serial.println("Failed to connect MQTT - restarting ESP!");      
       ESP.restart();
   }
   else {
+      mqttConnected = 1;
       Serial.println("connected**");
+      
   }
 }
 ///////////////////////////////////////////////////////////////////////
@@ -291,9 +299,15 @@ void MoveWheels(int a, int b, int c)
 {
   if (Setpoint >= 0)
   {
+    if (Setpoint == 0)
+    { analogWrite(motorBkwdA, 0); analogWrite(motorFrwdA, 0);
+      myPID.SetMode(MANUAL);
+      Output = 0;
+      myPID.SetMode(AUTOMATIC); }
+    else{
     analogWrite(motorBkwdA, 0);
     analogWrite(motorFrwdA, 0);
-    analogWrite(motorFrwdA, a);
+    analogWrite(motorFrwdA, a);}
     
   }
   else 
@@ -305,23 +319,34 @@ void MoveWheels(int a, int b, int c)
   }
   if (SetpointB >= 0)
   {
-    analogWrite(motorBkwdB, 0);
-    analogWrite(motorFrwdB, 0);
-    analogWrite(motorFrwdB, b);
+    if (SetpointB == 0)
+    { analogWrite(motorBkwdB, 0); analogWrite(motorFrwdB, 0);
+      myPIDB.SetMode(MANUAL);
+      OutputB = 0;
+      myPIDB.SetMode(AUTOMATIC); }
+    else{
+      analogWrite(motorBkwdB, 0);
+      analogWrite(motorFrwdB, 0);
+      analogWrite(motorFrwdB, b);}
     
   }
   else 
   {
     analogWrite(motorFrwdB, 0); 
     analogWrite(motorBkwdB, 0); 
-    analogWrite(motorBkwdB, b);
-       
+    analogWrite(motorBkwdB, b);       
   }
   if (SetpointC >= 0)
   {
-    analogWrite(motorBkwdC, 0);
-    analogWrite(motorFrwdC, 0);
-    analogWrite(motorFrwdC, c);
+    if (SetpointC == 0)
+    {   analogWrite(motorBkwdC, 0); analogWrite(motorFrwdC, 0);
+      myPIDC.SetMode(MANUAL);
+      OutputC = 0;
+      myPIDC.SetMode(AUTOMATIC);}
+    else{
+        analogWrite(motorBkwdC, 0);
+        analogWrite(motorFrwdC, 0);
+        analogWrite(motorFrwdC, c);}
     
   }
   else 
@@ -377,31 +402,54 @@ float CalcVelocity (int motorLabel)
       media+= velVect[i];
   }
   media = media/filterNumber;
-  velVect[filterNumber -1 ] = media;
+  //velVect[filterNumber -1 ] = media;
   
   if (motorLabel==1){
     for(int i=0; i < filterNumber; i++)
     {
-      velVectA[i]=velVect[i];
-      LastEncodervalueA = Encodervalue;
+      velVectA[i]=velVect[i];      
     }
+    LastEncodervalueA = Encodervalue;
   }
   if (motorLabel==2){
     for(int i=0; i < filterNumber; i++)
     {
-      velVectB[i]=velVect[i];
-      LastEncodervalueB = Encodervalue;
+      velVectB[i]=velVect[i];      
     }
+    LastEncodervalueB = Encodervalue;
   }
   if (motorLabel==3){
     for(int i=0; i < filterNumber; i++)
     {
-      velVectC[i]=velVect[i];
-      LastEncodervalueC = Encodervalue;
+      velVectC[i]=velVect[i];      
     }
+    LastEncodervalueC = Encodervalue;
   }
   return (media);
 
 }
 
 /////////////////////////////////////////////////////////////////////////
+
+void LedStatus()
+{
+  if ((internetConnected >= 1) && (mqttConnected >= 1 )) 
+  {
+    if(ledChk < 3 )
+    {
+      digitalWrite(ledPin, LOW);
+      ledChk++;
+    }
+    if(ledChk >= 3 )
+    {
+      digitalWrite(ledPin, HIGH);
+      ledChk=0;
+    }
+    
+  }
+  if ((internetConnected==1) &&(mqttConnected == 0 )) 
+  {
+    digitalWrite(ledPin, !digitalRead(ledPin));
+  }
+  
+}
