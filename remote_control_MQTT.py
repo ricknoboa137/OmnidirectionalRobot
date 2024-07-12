@@ -2,6 +2,7 @@ from paho.mqtt import client as mqtt_client
 import random 
 import pygame
 import time
+import json
 
 # Define the IP address and port for broadcasting
 broker = '192.168.0.110'#'192.168.0.108'  # Broadcast to all devices on the network
@@ -70,15 +71,29 @@ while cont == 1:
     #publish(client, "Helloooo")
     # Check if there's a joystick connected
     #pygame.init()
+    joystick_data = []
     if not pygame.joystick.get_count():
         print("Error: No joystick detected.")
         pygame.quit()
         client.loop_stop()
         #quit()
     pygame.event.get()
+    axes = joystick.get_numaxes()
+    buttons = joystick.get_numbuttons()
+
+    joystick_info = json.dumps({
+        "joystick_id": 1,
+        "name": joystick.get_name(),
+        "axes": [joystick.get_axis(j) for j in range(axes)],
+        "buttons": [joystick.get_button(j) for j in range(buttons)],
+        "num_axes": axes,
+        "num_buttons": buttons
+    })
+    #joystick_data.append(joystick_info)
+
     x_axis = joystick.get_axis(0)  # Left thumbstick horizontal (-1 to 1)
     y_axis = joystick.get_axis(1)  # Left thumbstick vertical (-1 to 1)
-    publish(client, x_axis)
+    publish(client, joystick_info)
     time.sleep(0.1)  # Adjust sleep time as needed
 
 
