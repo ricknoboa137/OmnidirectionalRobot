@@ -6,7 +6,7 @@ import time
 # Define the IP address and port for broadcasting
 broker = '192.168.0.110'#'192.168.0.108'  # Broadcast to all devices on the network
 port = 1883
-topic = "motor_velocities"
+topic = "gamepad/joystick"
 cont = 1
 
 # Generate a Client ID with the publish prefix.
@@ -63,11 +63,13 @@ print(f"Connected joystick: {joystick_name}")
 running = True
 clock = pygame.time.Clock()  # Used for recording timerunning = True
 clock.tick(60)  # Update at most 60 times per second
+
+
 while cont == 1:
     #cont =2
     #publish(client, "Helloooo")
     # Check if there's a joystick connected
-    pygame.init()
+    #pygame.init()
     if not pygame.joystick.get_count():
         print("Error: No joystick detected.")
         pygame.quit()
@@ -77,6 +79,7 @@ while cont == 1:
     x_axis = joystick.get_axis(0)  # Left thumbstick horizontal (-1 to 1)
     y_axis = joystick.get_axis(1)  # Left thumbstick vertical (-1 to 1)
     publish(client, x_axis)
+    time.sleep(0.1)  # Adjust sleep time as needed
 
 
 client.loop_stop()
@@ -84,6 +87,3 @@ client.loop_stop()
 pygame.quit()
 #cap.release()
 ##################################################################################
-
-
-
