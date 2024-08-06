@@ -8,7 +8,7 @@ char *strings[3];
 float velocity_values[3]={0,0,0};
 char *ptr = NULL;
 uint32_t x=0;
-char mqtt_server[40]= "192.168.0.110";
+char mqtt_server[40]= "192.168.0.200";
 char mqtt_port[6] = "1883";
 
 WiFiManager wm;
@@ -45,31 +45,31 @@ double Setpoint, Input, Output;
 double SetpointB, InputB, OutputB;
 double SetpointC, InputC, OutputC;
 double absSetpointA, absSetpointB, absSetpointC;
-double Kp=1.3, Ki= 7, Kd=0.051;
+double Kp=4.2, Ki= 0, Kd=0;
 PID myPID(&Input, &Output, &absSetpointA, Kp, Ki, Kd, DIRECT);
 PID myPIDB(&InputB, &OutputB, &absSetpointB, Kp, Ki, Kd, DIRECT);
 PID myPIDC(&InputC, &OutputC, &absSetpointC, Kp, Ki, Kd, DIRECT);
 //////////////////////////////////////////INTERRUPCTIONS///////////////////////////////
 void IRAM_ATTR isrA() {
  if (digitalRead(encPinA1)> digitalRead(encPinA2))
-  EncodervalueA++;
- else
   EncodervalueA--;
+ else
+  EncodervalueA++;
 }
 
 
 void IRAM_ATTR isrB() {
  if (digitalRead(encPinB1)> digitalRead(encPinB2))
-  EncodervalueB++;
- else
   EncodervalueB--;
+ else
+  EncodervalueB++;
 }
 
 void IRAM_ATTR isrC() {
  if (digitalRead(encPinC1)> digitalRead(encPinC2))
-  EncodervalueC++;
- else
   EncodervalueC--;
+ else
+  EncodervalueC++;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
@@ -183,9 +183,9 @@ void loop() {
   myPIDB.Compute();
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
-  //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
-  //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
-  //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
+  Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
+  Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
+  Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
   //Serial.println(vA);
   //Serial.print(internetConnected);Serial.print(" , ");Serial.println(mqttConnected);
  }
@@ -213,13 +213,13 @@ String getParam(String name){
 }
 //////////////////////////////////////////////////////////////////
 void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived on topic: ");
-  Serial.println(topic);
-  Serial.print("Message: ");
+  //Serial.print("Message arrived on topic: ");
+  //Serial.println(topic);
+  //Serial.print("Message: ");
   //String inMessage;
-  char message[11]="";
+  char message[200]=" ";
   for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+    //Serial.print((char)payload[i]);
     //inMessage+=(char)payload[i];
     message[i]=(char)payload[i];
   }
@@ -307,14 +307,14 @@ void MoveWheels(int a, int b, int c)
     else{
     analogWrite(motorBkwdA, 0);
     analogWrite(motorFrwdA, 0);
-    analogWrite(motorFrwdA, a);}
+    analogWrite(motorBkwdA, a);}
     
   }
   else 
   {
     analogWrite(motorFrwdA, 0); 
     analogWrite(motorBkwdA, 0); 
-    analogWrite(motorBkwdA, a);
+    analogWrite(motorFrwdA, a);
        
   }
   if (SetpointB >= 0)
@@ -327,14 +327,14 @@ void MoveWheels(int a, int b, int c)
     else{
       analogWrite(motorBkwdB, 0);
       analogWrite(motorFrwdB, 0);
-      analogWrite(motorFrwdB, b);}
+      analogWrite(motorBkwdB, b);}
     
   }
   else 
   {
     analogWrite(motorFrwdB, 0); 
     analogWrite(motorBkwdB, 0); 
-    analogWrite(motorBkwdB, b);       
+    analogWrite(motorFrwdB, b);       
   }
   if (SetpointC >= 0)
   {
@@ -346,14 +346,14 @@ void MoveWheels(int a, int b, int c)
     else{
         analogWrite(motorBkwdC, 0);
         analogWrite(motorFrwdC, 0);
-        analogWrite(motorFrwdC, c);}
+        analogWrite(motorBkwdC, c);}
     
   }
   else 
   {
     analogWrite(motorFrwdC, 0); 
     analogWrite(motorBkwdC, 0); 
-    analogWrite(motorBkwdC, c);
+    analogWrite(motorFrwdC, c);
        
   }
 
