@@ -8,7 +8,7 @@ char *strings[3];
 float velocity_values[3]={0,0,0};
 char *ptr = NULL;
 uint32_t x=0;
-char mqtt_server[40]= "192.168.0.200";
+char mqtt_server[40]= "192.168.0.109";
 char mqtt_port[6] = "1883";
 
 WiFiManager wm;
@@ -37,7 +37,7 @@ int internetConnected =0, mqttConnected =0;
 volatile unsigned prevLedTime=0, currLedTime=0;
 int sampleTime = 5, ledChk=0;;
 int N = 692; // ticks per rev 
-float diam = 6.5, velA, velB, velC;
+float diam = 6.0, velA, velB, velC;
 double freqA=0;
 double wA=0;
 double vA=0;
@@ -45,34 +45,37 @@ double Setpoint, Input, Output;
 double SetpointB, InputB, OutputB;
 double SetpointC, InputC, OutputC;
 double absSetpointA, absSetpointB, absSetpointC;
-double Kp=4.2, Ki= 0, Kd=0;
+double Kp=4.0, Ki= 23, Kd=0.012;
 PID myPID(&Input, &Output, &absSetpointA, Kp, Ki, Kd, DIRECT);
 PID myPIDB(&InputB, &OutputB, &absSetpointB, Kp, Ki, Kd, DIRECT);
 PID myPIDC(&InputC, &OutputC, &absSetpointC, Kp, Ki, Kd, DIRECT);
 //////////////////////////////////////////INTERRUPCTIONS///////////////////////////////
 void IRAM_ATTR isrA() {
  if (digitalRead(encPinA1)> digitalRead(encPinA2))
-  EncodervalueA--;
- else
   EncodervalueA++;
+ else
+  EncodervalueA--;
+ //Serial.println(EncodervalueA);
 }
 
 
 void IRAM_ATTR isrB() {
  if (digitalRead(encPinB1)> digitalRead(encPinB2))
-  EncodervalueB--;
- else
   EncodervalueB++;
+ else
+  EncodervalueB--;
+
 }
 
 void IRAM_ATTR isrC() {
  if (digitalRead(encPinC1)> digitalRead(encPinC2))
-  EncodervalueC--;
- else
   EncodervalueC++;
+ else
+  EncodervalueC--;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
+    Serial.begin(115200);
     pinMode(motorFrwdA, OUTPUT);
     pinMode(motorBkwdA, OUTPUT);
     pinMode(motorFrwdB, OUTPUT);
@@ -88,7 +91,7 @@ void setup() {
     analogWrite(motorBkwdC, 0);
     LedStatus();
     //WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
-    Serial.begin(115200);
+    
     // reset settings - wipe stored credentials for testing
     // these are stored by the esp library
     //wm.resetSettings();
@@ -142,7 +145,7 @@ void setup() {
     myPID.SetMode(AUTOMATIC);
     myPIDB.SetMode(AUTOMATIC);
     myPIDC.SetMode(AUTOMATIC);
-    delay(200);
+    //delay(200);
     
 
 }
@@ -183,9 +186,9 @@ void loop() {
   myPIDB.Compute();
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
-  Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
-  Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
-  Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
+  //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
+  //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
+  //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
   //Serial.println(vA);
   //Serial.print(internetConnected);Serial.print(" , ");Serial.println(mqttConnected);
  }
@@ -223,8 +226,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
     //inMessage+=(char)payload[i];
     message[i]=(char)payload[i];
   }
-  Serial.println("");
-  //inMessage.toCharArray(message, inMessage.length() + 1);
+  //Serial.println("");
+  
   byte index = 0;
   ptr = strtok(message, ",");  // delimiter
   while (ptr != NULL)
@@ -235,9 +238,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
    }
   for (int n = 0; n < index; n++)
    {
-      Serial.print(n);
-      Serial.print("  ");
-      Serial.println(strings[n]);
+      //Serial.print(n);
+      //Serial.print("  ");
+      //Serial.println(strings[n]);
       velocity_values[n]=atof(strings[n]);
    }
   Setpoint=velocity_values[0];
@@ -307,14 +310,14 @@ void MoveWheels(int a, int b, int c)
     else{
     analogWrite(motorBkwdA, 0);
     analogWrite(motorFrwdA, 0);
-    analogWrite(motorBkwdA, a);}
+    analogWrite(motorFrwdA, a);}
     
   }
   else 
   {
     analogWrite(motorFrwdA, 0); 
     analogWrite(motorBkwdA, 0); 
-    analogWrite(motorFrwdA, a);
+    analogWrite(motorBkwdA, a);
        
   }
   if (SetpointB >= 0)
@@ -327,14 +330,14 @@ void MoveWheels(int a, int b, int c)
     else{
       analogWrite(motorBkwdB, 0);
       analogWrite(motorFrwdB, 0);
-      analogWrite(motorBkwdB, b);}
+      analogWrite(motorFrwdB, b);}
     
   }
   else 
   {
     analogWrite(motorFrwdB, 0); 
     analogWrite(motorBkwdB, 0); 
-    analogWrite(motorFrwdB, b);       
+    analogWrite(motorBkwdB, b);       
   }
   if (SetpointC >= 0)
   {
@@ -346,14 +349,14 @@ void MoveWheels(int a, int b, int c)
     else{
         analogWrite(motorBkwdC, 0);
         analogWrite(motorFrwdC, 0);
-        analogWrite(motorBkwdC, c);}
+        analogWrite(motorFrwdC, c);}
     
   }
   else 
   {
     analogWrite(motorFrwdC, 0); 
     analogWrite(motorBkwdC, 0); 
-    analogWrite(motorFrwdC, c);
+    analogWrite(motorBkwdC, c);
        
   }
 
@@ -397,7 +400,7 @@ float CalcVelocity (int motorLabel)
   for (int i = 0 ; i < filterNumber -1; i++){
       velVect[i] = velVect[i+1];
   }
-  velVect[filterNumber -1 ] = vA;
+  velVect[filterNumber -1 ] = wA;
   for (int i = 0 ; i < filterNumber ; i++){
       media+= velVect[i];
   }
