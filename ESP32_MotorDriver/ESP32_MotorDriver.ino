@@ -74,7 +74,7 @@ const uint16_t TELEM_MAX_AGE = 200;      // ms, send a partial batch after this 
 const uint16_t TELEM_QUEUE_LEN = 200;    // samples buffered while the network is busy
 
 // MQTT broker, editable from the WiFiManager portal
-char mqtt_server[40] = "192.168.0.109";
+char mqtt_server[40] = "192.168.0.153";
 char mqtt_port[6] = "1883";
 
 /////////////////////////////////// STATE //////////////////////////////////////
