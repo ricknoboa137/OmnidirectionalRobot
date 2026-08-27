@@ -49,6 +49,31 @@ double Kp=4.0, Ki= 23, Kd=0.012;
 PID myPID(&Input, &Output, &absSetpointA, Kp, Ki, Kd, DIRECT);
 PID myPIDB(&InputB, &OutputB, &absSetpointB, Kp, Ki, Kd, DIRECT);
 PID myPIDC(&InputC, &OutputC, &absSetpointC, Kp, Ki, Kd, DIRECT);
+//////////////////////////////////TELEMETRY/////////////////////////////////////
+// Streams the measured wheel velocities (plus setpoints and PID outputs) back
+// over MQTT so the host can store them in a log file and plot the controller
+// response. One sample is taken every control cycle (sampleTime ms) and the
+// samples are sent in batches, to keep the packet rate low without losing time
+// resolution.
+const char *telemetryTopic = "motor_telemetry";          // ESP32 -> host, CSV rows
+const char *telemetryCtrlTopic = "motor_telemetry_ctrl"; // host -> ESP32, "1"/"0"/"s1"/"s0"
+const uint16_t TELEM_BUFFER_SIZE = 1024;  // MQTT packet buffer (PubSubClient defaults to only 256)
+const uint8_t TELEM_BATCH = 8;            // rows per MQTT message ( 8 * 5 ms = one packet every 40 ms )
+const uint16_t TELEM_MAX_AGE = 200;       // ms, send a partial batch after this long
+int telemetryEnabled = 1;                 // stream over MQTT
+int telemetryToSerial = 0;                // mirror the same CSV rows on the USB serial port
+char telemPayload[TELEM_BUFFER_SIZE];
+uint16_t telemLen = 0;
+uint8_t telemRows = 0;
+uint32_t telemSeq = 0;                    // row counter, lets the logger spot dropped packets
+uint32_t telemDropped = 0;
+unsigned long telemLastFlush = 0;
+unsigned long telemLastWarn = 0;
+// column layout of every telemetry row, published on each MQTT (re)connection
+const char *telemHeader = "#seq,t_ms,setA,velA,pwmA,setB,velB,pwmB,setC,velC,pwmC";
+void LogVelocities();
+void FlushTelemetry();
+////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////INTERRUPCTIONS///////////////////////////////
 void IRAM_ATTR isrA() {
  if (digitalRead(encPinA1)> digitalRead(encPinA2))
@@ -107,6 +132,11 @@ void setup() {
 
     client.setServer(mqtt_server, atoi(mqtt_port));
     client.setCallback(callback);
+    // enlarge the MQTT packet buffer so a batch of telemetry rows fits in one message
+    if (!client.setBufferSize(TELEM_BUFFER_SIZE)) {
+      Serial.println("Could not allocate the telemetry MQTT buffer - telemetry disabled");
+      telemetryEnabled = 0;
+    }
 
 
     bool res;
@@ -124,6 +154,7 @@ void setup() {
         reconnect(); //connect MQTT        
     }
     client.subscribe("motor_velocities");
+    client.subscribe(telemetryCtrlTopic);
     pinMode(encPinA1, INPUT_PULLUP);
     pinMode(encPinA2, INPUT_PULLUP);
     pinMode(encPinB1, INPUT_PULLUP);
@@ -186,6 +217,7 @@ void loop() {
   myPIDB.Compute();
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
+  LogVelocities();   // stream velA/velB/velC (+ setpoints and PWM) back to the host
   //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
   //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
   //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
@@ -216,11 +248,30 @@ String getParam(String name){
 }
 //////////////////////////////////////////////////////////////////
 void callback(char* topic, byte* payload, unsigned int length) {
+  // telemetry control channel: "1"/"0" start-stop the MQTT stream,
+  // "s1"/"s0" start-stop the copy printed on the USB serial port
+  if (strcmp(topic, telemetryCtrlTopic) == 0) {
+    if (length > 0) {
+      if ((char)payload[0] == 's') {
+        telemetryToSerial = (length > 1 && (char)payload[1] == '1') ? 1 : 0;
+        Serial.print("Telemetry on serial: "); Serial.println(telemetryToSerial);
+      }
+      else {
+        telemetryEnabled = ((char)payload[0] == '1') ? 1 : 0;
+        telemLen = 0;
+        telemRows = 0;
+        if (telemetryEnabled) client.publish(telemetryTopic, telemHeader);
+        Serial.print("Telemetry over MQTT: "); Serial.println(telemetryEnabled);
+      }
+    }
+    return;
+  }
   //Serial.print("Message arrived on topic: ");
   //Serial.println(topic);
   //Serial.print("Message: ");
   //String inMessage;
   char message[200]=" ";
+  if (length > sizeof(message) - 1) length = sizeof(message) - 1;  // keep the copy inside the buffer
   for (int i = 0; i < length; i++) {
     //Serial.print((char)payload[i]);
     //inMessage+=(char)payload[i];
@@ -273,6 +324,11 @@ void reconnect() {
           client.publish("DriverCheck", "OK");
           // ... and resubscribe
           client.subscribe("motor_velocities");
+          client.subscribe(telemetryCtrlTopic);
+          // re-send the CSV header so a logger started later still knows the columns
+          client.publish(telemetryTopic, telemHeader);
+          telemLen = 0;
+          telemRows = 0;
         }
         else {
           mqttConnected = 0;
@@ -455,4 +511,58 @@ void LedStatus()
     digitalWrite(ledPin, !digitalRead(ledPin));
   }
   
+}
+
+/////////////////////////////////////////////////////////////////////////
+////////////////////////TELEMETRY / VELOCITY LOG/////////////////////////
+// One CSV row per control cycle:
+//   seq,t_ms,setA,velA,pwmA,setB,velB,pwmB,setC,velC,pwmC
+// velX is the filtered angular velocity in rad/s (signed, from the encoders),
+// setX is the commanded velocity, pwmX is the PID output signed by the
+// commanded direction, so the response can be plotted straight from the log.
+
+void LogVelocities()
+{
+  if (!telemetryEnabled && !telemetryToSerial) return;
+
+  char row[112];
+  int n = snprintf(row, sizeof(row),
+                   "%lu,%lu,%.3f,%.3f,%.1f,%.3f,%.3f,%.1f,%.3f,%.3f,%.1f\n",
+                   (unsigned long)telemSeq, (unsigned long)millis(),
+                   Setpoint,  (double)velA, (Setpoint  < 0 ? -Output  : Output),
+                   SetpointB, (double)velB, (SetpointB < 0 ? -OutputB : OutputB),
+                   SetpointC, (double)velC, (SetpointC < 0 ? -OutputC : OutputC));
+  telemSeq++;
+  if (n <= 0) return;
+  if (n >= (int)sizeof(row)) n = sizeof(row) - 1;   // snprintf truncated the row
+
+  if (telemetryToSerial) Serial.print(row);
+  if (!telemetryEnabled) return;
+
+  // flush first if this row would not fit in the packet buffer
+  if (telemLen + n >= (int)sizeof(telemPayload) - 1) FlushTelemetry();
+
+  memcpy(telemPayload + telemLen, row, n);
+  telemLen += n;
+  telemPayload[telemLen] = '\0';
+  telemRows++;
+
+  if (telemRows >= TELEM_BATCH || (millis() - telemLastFlush) >= TELEM_MAX_AGE) FlushTelemetry();
+}
+/////////////////////////////////////////////////////////////////////////
+void FlushTelemetry()
+{
+  telemLastFlush = millis();
+  if (telemLen == 0) return;
+
+  // drop the batch rather than block the control loop if MQTT is down
+  if (!client.connected() || !client.publish(telemetryTopic, (uint8_t *)telemPayload, telemLen, false)) {
+    telemDropped += telemRows;
+    if (millis() - telemLastWarn >= 5000) {   // do not flood the serial port
+      telemLastWarn = millis();
+      Serial.print("Telemetry rows dropped so far: "); Serial.println(telemDropped);
+    }
+  }
+  telemLen = 0;
+  telemRows = 0;
 }
