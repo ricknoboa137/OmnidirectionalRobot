@@ -1,15 +1,83 @@
+/*
+ * Motor driver for the three wheeled omnidirectional platform.
+ *
+ * The sketch runs two FreeRTOS tasks so that the network can never hold up the
+ * wheels:
+ *
+ *   ControlTask   core 1, priority 3, every CONTROL_PERIOD_MS
+ *                 reads the encoders, filters the wheel velocities, runs one
+ *                 PID per wheel and writes the PWM outputs. It touches no
+ *                 network code at all: it reads the setpoints from a shared
+ *                 variable and drops the measurements into a queue.
+ *
+ *   NetworkTask   core 0, priority 1
+ *                 keeps WiFi and MQTT alive, receives the setpoints, empties
+ *                 the telemetry queue onto the broker and drives the LED.
+ *                 Everything in this task is allowed to be slow.
+ *
+ * A slow MQTT publish, a lost broker or a reconnection can no longer stall the
+ * control loop, which is what made the wheels stutter and start late.
+ *
+ * All velocities, commanded and measured, are wheel LINEAR velocities in cm/s.
+ *
+ * MQTT topics
+ *   motor_velocities      in    "<velA>,<velB>,<velC>"   cm/s
+ *   motor_telemetry       out   CSV rows, see telemHeader
+ *   motor_telemetry_ctrl  in    "1"/"0" stream on/off, "s1"/"s0" serial copy
+ *   DriverCheck           out   "OK" when the driver connects
+ */
+
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <PID_v1.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
+///////////////////////////////// CONFIGURATION ////////////////////////////////
 
-char *strings[3];
-float velocity_values[3]={0,0,0};
-char *ptr = NULL;
-uint32_t x=0;
-char mqtt_server[40]= "192.168.0.109";
+// pins, wheel A / B / C
+const uint8_t encPinA1 = 13, encPinA2 = 14, encPinB1 = 27, encPinB2 = 26, encPinC1 = 25, encPinC2 = 33;
+const uint8_t motorFrwdA = 22, motorBkwdA = 23, motorFrwdB = 18, motorBkwdB = 19, motorFrwdC = 17, motorBkwdC = 5;
+const uint8_t ledPin = 2;
+const uint8_t motorFrwd[3] = {motorFrwdA, motorFrwdB, motorFrwdC};
+const uint8_t motorBkwd[3] = {motorBkwdA, motorBkwdB, motorBkwdC};
+const uint8_t encPin1[3] = {encPinA1, encPinB1, encPinC1};
+const uint8_t encPin2[3] = {encPinA2, encPinB2, encPinC2};
+
+// mechanics
+const int   N = 692;             // encoder ticks per revolution
+const float diam = 6.0;          // wheel diameter [cm]
+const int   filterNumber = 10;   // length of the moving average on the velocity
+
+// control loop
+const int CONTROL_PERIOD_MS = 5; // period of ControlTask, also the PID sample time
+double Kp = 4.0, Ki = 23, Kd = 0.012;
+// MOTOR_MIN_PWM is the duty at which a wheel really starts turning under load.
+// Below it the motor only buzzes, so it is used as the lower PID output limit:
+// the integral term then never has to climb through that dead zone before the
+// wheel reacts to a new command. Calibrate it once - command a small velocity
+// and raise it until the wheels start without hesitating.
+const int MOTOR_MIN_PWM = 60;
+const int MOTOR_MAX_PWM = 255;
+
+// telemetry
+const char *velocityTopic = "motor_velocities";
+const char *telemetryTopic = "motor_telemetry";
+const char *telemetryCtrlTopic = "motor_telemetry_ctrl";
+const char *telemHeader = "#seq,t_ms,setA,velA,pwmA,setB,velB,pwmB,setC,velC,pwmC";
+const uint16_t TELEM_BUFFER_SIZE = 1024; // MQTT packet buffer (PubSubClient defaults to 256)
+const uint8_t  TELEM_DECIMATION = 2;     // log every Nth control cycle -> 100 Hz
+const uint8_t  TELEM_BATCH = 8;          // CSV rows per MQTT message
+const uint16_t TELEM_MAX_AGE = 200;      // ms, send a partial batch after this long
+const uint16_t TELEM_QUEUE_LEN = 200;    // samples buffered while the network is busy
+
+// MQTT broker, editable from the WiFiManager portal
+char mqtt_server[40] = "192.168.0.109";
 char mqtt_port[6] = "1883";
+
+/////////////////////////////////// STATE //////////////////////////////////////
 
 WiFiManager wm;
 WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
@@ -17,271 +85,322 @@ WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-const uint8_t encPinA1 = 13, encPinA2 = 14, encPinB1 = 27, encPinB2 = 26, encPinC1 = 25, encPinC2 = 33;
-const uint8_t motorFrwdA = 22, motorBkwdA = 23, motorFrwdB = 18, motorBkwdB = 19, motorFrwdC = 17, motorBkwdC = 5;
-const uint8_t ledPin = 2;
-volatile long Encodervalue=0, LastEncodervalue=0, DeltaEncodervalue=0;
-volatile long EncodervalueA=0, LastEncodervalueA=0, DeltaEncodervalueA=0;
-volatile long EncodervalueB=0, LastEncodervalueB=0, DeltaEncodervalueB=0;
-volatile long EncodervalueC=0, LastEncodervalueC=0, DeltaEncodervalueC=0;
-volatile unsigned prevSampTimeA=0, currSampTimeA=0, deltSampTimeA=0;
-volatile unsigned prevSampTimeB=0, currSampTimeB=0, deltSampTimeB=0;
-volatile unsigned prevSampTimeC=0, currSampTimeC=0, deltSampTimeC=0;
-unsigned long lastCalcTimeA=0, lastCalcTimeB=0, lastCalcTimeC=0;
-double dtSec=0;
-float velVect[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
-float velVectA[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
-float velVectB[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
-float velVectC[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
-int filterNumber =10;
-int cont = 0;
-int internetConnected =0, mqttConnected =0;
-volatile unsigned prevLedTime=0, currLedTime=0;
-int sampleTime = 5, ledChk=0;;
-int N = 692; // ticks per rev 
-float diam = 6.0, velA, velB, velC;
-double freqA=0;
-double wA=0;
-double vA=0;
-double Setpoint, Input, Output;
-double SetpointB, InputB, OutputB;
-double SetpointC, InputC, OutputC;
-double absSetpointA, absSetpointB, absSetpointC;
-// PWM range handed to the motors. MOTOR_MIN_PWM is the duty at which the wheel
-// actually starts turning under load: below it the motor only buzzes, so the
-// integral term used to have to climb through that dead zone on every new
-// command, which is what made the wheels take so long to start. Keeping it as
-// the lower output limit means the PID never sits below the point where the
-// motor moves. Calibrate it once: command a very small velocity and raise the
-// value until the wheels start without hesitating.
-const int MOTOR_MIN_PWM = 60;
-const int MOTOR_MAX_PWM = 255;
-// Units of the setpoints published on "motor_velocities".
-// practice1.ipynb divides the wheel linear velocity by the wheel radius before
-// publishing, so what arrives is the wheel ANGULAR velocity in rad/s, which is
-// what the encoders measure directly -> SETPOINT_SCALE = 1.0.
-// If the host is changed to publish the wheel LINEAR velocity in cm/s instead,
-// set SETPOINT_SCALE to the wheel radius in cm (the host kinematics use 5.8/2).
-const double SETPOINT_SCALE = 1.0;   // rad/s ; use 2.9 for cm/s
-double Kp=4.0, Ki= 23, Kd=0.012;
-PID myPID(&Input, &Output, &absSetpointA, Kp, Ki, Kd, DIRECT);
-PID myPIDB(&InputB, &OutputB, &absSetpointB, Kp, Ki, Kd, DIRECT);
-PID myPIDC(&InputC, &OutputC, &absSetpointC, Kp, Ki, Kd, DIRECT);
-//////////////////////////////////TELEMETRY/////////////////////////////////////
-// Streams the measured wheel velocities (plus setpoints and PID outputs) back
-// over MQTT so the host can store them in a log file and plot the controller
-// response. One sample is taken every control cycle (sampleTime ms) and the
-// samples are sent in batches, to keep the packet rate low without losing time
-// resolution.
-const char *telemetryTopic = "motor_telemetry";          // ESP32 -> host, CSV rows
-const char *telemetryCtrlTopic = "motor_telemetry_ctrl"; // host -> ESP32, "1"/"0"/"s1"/"s0"
-const uint16_t TELEM_BUFFER_SIZE = 1024;  // MQTT packet buffer (PubSubClient defaults to only 256)
-const uint8_t TELEM_BATCH = 8;            // rows per MQTT message ( 8 * 5 ms = one packet every 40 ms )
-const uint16_t TELEM_MAX_AGE = 200;       // ms, send a partial batch after this long
-int telemetryEnabled = 1;                 // stream over MQTT
-int telemetryToSerial = 0;                // mirror the same CSV rows on the USB serial port
+// --- shared between the two tasks --------------------------------------------
+// the setpoints are written by NetworkTask and read by ControlTask, so they are
+// copied under a spinlock; the telemetry travels the other way through a queue
+portMUX_TYPE setpointMux = portMUX_INITIALIZER_UNLOCKED;
+volatile float setpointCmd[3] = {0, 0, 0};   // cm/s
+
+typedef struct {
+  uint32_t seq;
+  uint32_t t_ms;
+  float set[3];
+  float vel[3];
+  float pwm[3];
+} TelemSample;
+
+QueueHandle_t telemQueue = NULL;
+volatile uint32_t telemDropped = 0;          // samples that did not make it out
+
+// --- owned by ControlTask ----------------------------------------------------
+volatile long encCount[3] = {0, 0, 0};       // updated in the interrupts
+long lastEncCount[3] = {0, 0, 0};
+unsigned long lastCalcTime[3] = {0, 0, 0};
+float velFilter[3][filterNumber];
+double pidInput[3], pidOutput[3], pidSetpointAbs[3];
+PID pidA(&pidInput[0], &pidOutput[0], &pidSetpointAbs[0], Kp, Ki, Kd, DIRECT);
+PID pidB(&pidInput[1], &pidOutput[1], &pidSetpointAbs[1], Kp, Ki, Kd, DIRECT);
+PID pidC(&pidInput[2], &pidOutput[2], &pidSetpointAbs[2], Kp, Ki, Kd, DIRECT);
+PID *pids[3] = {&pidA, &pidB, &pidC};
+
+// --- owned by NetworkTask ----------------------------------------------------
+int internetConnected = 0, mqttConnected = 0;
+int ledChk = 0;
+unsigned long lastReconnectAttempt = 0;
+int telemetryEnabled = 1;                    // stream the telemetry over MQTT
+int telemetryToSerial = 0;                   // print the same rows on the USB port
 char telemPayload[TELEM_BUFFER_SIZE];
 uint16_t telemLen = 0;
 uint8_t telemRows = 0;
-uint32_t telemSeq = 0;                    // row counter, lets the logger spot dropped packets
-uint32_t telemDropped = 0;
 unsigned long telemLastFlush = 0;
 unsigned long telemLastWarn = 0;
-// column layout of every telemetry row, published on each MQTT (re)connection
-const char *telemHeader = "#seq,t_ms,setA,velA,pwmA,setB,velB,pwmB,setC,velC,pwmC";
-void LogVelocities();
+
+void ControlTask(void *parameter);
+void NetworkTask(void *parameter);
+float CalcVelocity(int wheel);
+void MoveWheel(int wheel, float setpoint, double output);
+void PublishTelemetry();
 void FlushTelemetry();
-////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////INTERRUPCTIONS///////////////////////////////
+void LedStatus();
+void reconnect();
+void callback(char *topic, byte *payload, unsigned int length);
+void saveParamCallback();
+String getParam(String name);
+
+///////////////////////////////// INTERRUPTS ///////////////////////////////////
+
 void IRAM_ATTR isrA() {
- if (digitalRead(encPinA1)> digitalRead(encPinA2))
-  EncodervalueA++;
- else
-  EncodervalueA--;
- //Serial.println(EncodervalueA);
+  if (digitalRead(encPinA1) > digitalRead(encPinA2)) encCount[0]++;
+  else encCount[0]--;
 }
 
-
 void IRAM_ATTR isrB() {
- if (digitalRead(encPinB1)> digitalRead(encPinB2))
-  EncodervalueB++;
- else
-  EncodervalueB--;
-
+  if (digitalRead(encPinB1) > digitalRead(encPinB2)) encCount[1]++;
+  else encCount[1]--;
 }
 
 void IRAM_ATTR isrC() {
- if (digitalRead(encPinC1)> digitalRead(encPinC2))
-  EncodervalueC++;
- else
-  EncodervalueC--;
+  if (digitalRead(encPinC1) > digitalRead(encPinC2)) encCount[2]++;
+  else encCount[2]--;
 }
-/////////////////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////// SETUP //////////////////////////////////////
+
 void setup() {
-    Serial.begin(115200);
-    pinMode(motorFrwdA, OUTPUT);
-    pinMode(motorBkwdA, OUTPUT);
-    pinMode(motorFrwdB, OUTPUT);
-    pinMode(motorBkwdB, OUTPUT);
-    pinMode(motorFrwdC, OUTPUT);
-    pinMode(motorBkwdC, OUTPUT);
-    pinMode(ledPin, OUTPUT);
-    analogWrite(motorFrwdA, 0);
-    analogWrite(motorBkwdA, 0);
-    analogWrite(motorFrwdB, 0);
-    analogWrite(motorBkwdB, 0);
-    analogWrite(motorFrwdC, 0);
-    analogWrite(motorBkwdC, 0);
-    LedStatus();
-    //WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
-    
-    // reset settings - wipe stored credentials for testing
-    // these are stored by the esp library
-    //wm.resetSettings();
-    // Automatically connect using saved credentials,
-    // if connection fails, it starts an access point with the specified name ( "AutoConnectAP"),
-    // if empty will auto generate SSID, if password is blank it will be anonymous AP (wm.autoConnect())
-    // then goes into a blocking loop awaiting configuration and will return success result
+  Serial.begin(115200);
 
-    wm.addParameter(&custom_mqtt_server);
-    wm.addParameter(&custom_mqtt_port);
-    wm.setSaveParamsCallback(saveParamCallback);
-    wm.setClass("invert"); // use darkmode
+  for (int w = 0; w < 3; w++) {
+    pinMode(motorFrwd[w], OUTPUT);
+    pinMode(motorBkwd[w], OUTPUT);
+    analogWrite(motorFrwd[w], 0);
+    analogWrite(motorBkwd[w], 0);
+    pinMode(encPin1[w], INPUT_PULLUP);
+    pinMode(encPin2[w], INPUT_PULLUP);
+    digitalWrite(encPin1[w], HIGH);   // turn pullup resistor on
+    digitalWrite(encPin2[w], HIGH);
+    for (int i = 0; i < filterNumber; i++) velFilter[w][i] = 0;
+  }
+  pinMode(ledPin, OUTPUT);
+  LedStatus();
 
-    client.setServer(mqtt_server, atoi(mqtt_port));
-    client.setCallback(callback);
-    // enlarge the MQTT packet buffer so a batch of telemetry rows fits in one message
-    if (!client.setBufferSize(TELEM_BUFFER_SIZE)) {
-      Serial.println("Could not allocate the telemetry MQTT buffer - telemetry disabled");
-      telemetryEnabled = 0;
-    }
+  // reset settings - wipe stored credentials for testing
+  //wm.resetSettings();
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_port);
+  wm.setSaveParamsCallback(saveParamCallback);
+  wm.setClass("invert"); // use darkmode
 
+  client.setServer(mqtt_server, atoi(mqtt_port));
+  client.setCallback(callback);
+  if (!client.setBufferSize(TELEM_BUFFER_SIZE)) {
+    Serial.println("Could not allocate the telemetry MQTT buffer - telemetry disabled");
+    telemetryEnabled = 0;
+  }
 
-    bool res;
-    res = wm.autoConnect("Motor_Driver"); // password protected ap ,"password"
+  // connects with the saved credentials, otherwise opens the configuration AP
+  if (!wm.autoConnect("Motor_Driver")) {
+    internetConnected = 0;
+    Serial.println("Failed to connect");
+  }
+  else {
+    Serial.println("connected...yeey :):):)");
+    internetConnected = 1;
+  }
+  // the ESP32 station defaults to WIFI_PS_MIN_MODEM: the radio then only wakes
+  // on the access point beacon, and incoming setpoints are delivered a few
+  // hundred ms late
+  WiFi.setSleep(false);
 
-    if(!res) {
-        internetConnected = 0;
-        Serial.println("Failed to connect");
-        // ESP.restart();
-    } 
-    else {
-        //if you get here you have connected to the WiFi    
-        Serial.println("connected...yeey :):):)");
-        // the ESP32 station defaults to WIFI_PS_MIN_MODEM, so the radio only
-        // wakes on the AP beacon and incoming MQTT messages sit in the access
-        // point for up to a few hundred ms before they are delivered
-        WiFi.setSleep(false);
-        internetConnected = 1;
-        reconnect(); //connect MQTT        
-    }
-    client.subscribe("motor_velocities");
-    client.subscribe(telemetryCtrlTopic);
-    pinMode(encPinA1, INPUT_PULLUP);
-    pinMode(encPinA2, INPUT_PULLUP);
-    pinMode(encPinB1, INPUT_PULLUP);
-    pinMode(encPinB2, INPUT_PULLUP);
-    pinMode(encPinC1, INPUT_PULLUP);
-    pinMode(encPinC2, INPUT_PULLUP);
-    digitalWrite(encPinA1, HIGH); //turn pullup resistor on
-    digitalWrite(encPinA2, HIGH); 
-    digitalWrite(encPinB1, HIGH); //turn pullup resistor on
-    digitalWrite(encPinB2, HIGH); 
-    digitalWrite(encPinC1, HIGH); //turn pullup resistor on
-    digitalWrite(encPinC2, HIGH); 
-    attachInterrupt(encPinA1, isrA, RISING);
-    attachInterrupt(encPinB1, isrB, RISING);
-    attachInterrupt(encPinC1, isrC, RISING);
-    prevLedTime = millis();
-    currSampTimeA = millis();
-    //Setpoint = 0;
-    // the PID library defaults to a 100 ms sample time, so Compute() ignored 19
-    // out of every 20 calls and the loop reacted 100 ms late; run it at the rate
-    // the velocities are actually sampled
-    myPID.SetSampleTime(sampleTime);
-    myPIDB.SetSampleTime(sampleTime);
-    myPIDC.SetSampleTime(sampleTime);
-    myPID.SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
-    myPIDB.SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
-    myPIDC.SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
-    myPID.SetMode(AUTOMATIC);
-    myPIDB.SetMode(AUTOMATIC);
-    myPIDC.SetMode(AUTOMATIC);
-    //delay(200);
-    
+  attachInterrupt(encPinA1, isrA, RISING);
+  attachInterrupt(encPinB1, isrB, RISING);
+  attachInterrupt(encPinC1, isrC, RISING);
 
+  for (int w = 0; w < 3; w++) {
+    // the PID library defaults to a 100 ms sample time, twenty times slower
+    // than the loop that calls it
+    pids[w]->SetSampleTime(CONTROL_PERIOD_MS);
+    pids[w]->SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
+    pids[w]->SetMode(AUTOMATIC);
+    lastCalcTime[w] = micros();
+  }
+
+  telemQueue = xQueueCreate(TELEM_QUEUE_LEN, sizeof(TelemSample));
+  if (telemQueue == NULL) {
+    Serial.println("Could not allocate the telemetry queue - telemetry disabled");
+    telemetryEnabled = 0;
+  }
+
+  xTaskCreatePinnedToCore(ControlTask, "control", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(NetworkTask, "network", 8192, NULL, 1, NULL, 0);
 }
 
 void loop() {
-    // put your main code here, to run repeatedly:  
-  if ((WiFi.status() != WL_CONNECTED) || (WiFi.localIP().toString() == "0.0.0.0")) {
-    internetConnected =0;
-    Serial.println("ROUTER DISCONNECTED !!!!");
-  }
-  else{
-    internetConnected =1;
-  }
-
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-  
-  if (millis()-currLedTime >= 330)
- {
-    LedStatus();
-    currLedTime=millis();
- }
- // the MQTT write is done between control ticks so it cannot delay one
- if (telemRows >= TELEM_BATCH || (telemRows > 0 && millis() - telemLastFlush >= TELEM_MAX_AGE)) FlushTelemetry();
-
- if (millis()-currSampTimeA >= sampleTime)
- {
-  
-  velA = CalcVelocity(1);
-  currSampTimeA = millis();
-  velB = CalcVelocity(2);
-  currSampTimeB = millis();
-  velC = CalcVelocity(3);
-  currSampTimeC = millis();  
-  Input  = abs(velA) * SETPOINT_SCALE;
-  InputB = abs(velB) * SETPOINT_SCALE;
-  InputC = abs(velC) * SETPOINT_SCALE;
-  myPID.Compute();
-  myPIDB.Compute();
-  myPIDC.Compute();
-  MoveWheels(Output,OutputB,OutputC);
-  LogVelocities();   // queue velA/velB/velC (+ setpoints and PWM) for the host
-  //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
-  //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
-  //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
-  //Serial.println(vA);
-  //Serial.print(internetConnected);Serial.print(" , ");Serial.println(mqttConnected);
- }
+  // everything happens in the two tasks
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
+///////////////////////////////// CONTROL TASK /////////////////////////////////
 
-//////////////////////////////////////////////////////////////////////
-void saveParamCallback(){
-  Serial.println("[CALLBACK] saveParamCallback fired");
-  String server_temp = getParam("mqtt_server");
-  String port_temp = getParam("mqtt_port");  
-  server_temp.toCharArray(mqtt_server, server_temp.length() + 1);
-  port_temp.toCharArray(mqtt_port, port_temp.length() + 1);
-  Serial.print("PARAM mqtt_server = " + server_temp );
-  Serial.println("PARAM mqtt_port = " +  port_temp);
+void ControlTask(void *parameter) {
+  TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
+  if (period == 0) period = 1;
+  TickType_t lastWake = xTaskGetTickCount();
+  uint32_t seq = 0;
+  uint8_t decimation = 0;
 
+  for (;;) {
+    vTaskDelayUntil(&lastWake, period);   // fixed period, whatever the network is doing
+
+    float setpoint[3];
+    portENTER_CRITICAL(&setpointMux);
+    setpoint[0] = setpointCmd[0];
+    setpoint[1] = setpointCmd[1];
+    setpoint[2] = setpointCmd[2];
+    portEXIT_CRITICAL(&setpointMux);
+
+    float vel[3];
+    for (int w = 0; w < 3; w++) {
+      vel[w] = CalcVelocity(w);
+      // the PID works on magnitudes, the sign of the setpoint picks the direction
+      pidInput[w] = fabs(vel[w]);
+      pidSetpointAbs[w] = fabs(setpoint[w]);
+      if (setpoint[w] == 0) {
+        // stopped: the integral is reset to the lower output limit, so the next
+        // command acts at once instead of ramping up from zero
+        pids[w]->SetMode(MANUAL);
+        pidOutput[w] = 0;
+        pids[w]->SetMode(AUTOMATIC);
+      }
+      else {
+        pids[w]->Compute();
+      }
+      MoveWheel(w, setpoint[w], pidOutput[w]);
+    }
+
+    if (++decimation >= TELEM_DECIMATION) {
+      decimation = 0;
+      if (telemQueue != NULL) {
+        TelemSample sample;
+        sample.seq = seq++;
+        sample.t_ms = millis();
+        for (int w = 0; w < 3; w++) {
+          sample.set[w] = setpoint[w];
+          sample.vel[w] = vel[w];
+          sample.pwm[w] = (setpoint[w] < 0) ? -pidOutput[w] : pidOutput[w];
+        }
+        // never wait on the queue: a dropped sample is better than a late wheel
+        if (xQueueSend(telemQueue, &sample, 0) != pdTRUE) telemDropped++;
+      }
+    }
+  }
 }
-/////////////////////////////////////////////////////////////////////////
-String getParam(String name){
-  //read parameter from server, for customhmtl input
-  String value;
-  if(name == "mqtt_server") value = custom_mqtt_server.getValue();
-  else{   if(name =="mqtt_port") value = custom_mqtt_port.getValue();  }
-  return value;
+///////////////////////////////////////////////////////////////////////////////
+// Wheel linear velocity in cm/s, averaged over the last filterNumber samples.
+float CalcVelocity(int wheel) {
+  unsigned long now = micros();
+  double dt = (now - lastCalcTime[wheel]) / 1000000.0;
+  lastCalcTime[wheel] = now;
+  if (dt <= 0.0 || dt > 0.5) dt = CONTROL_PERIOD_MS / 1000.0;   // first call, or a stall
+
+  long count = encCount[wheel];
+  long delta = count - lastEncCount[wheel];
+  lastEncCount[wheel] = count;
+
+  double freq = delta / dt;                          // encoder ticks per second
+  double omega = ((2.0 * 3.14159265) / N) * freq;    // rad/s
+  double linear = (diam / 2.0) * omega;              // cm/s
+
+  for (int i = 0; i < filterNumber - 1; i++) velFilter[wheel][i] = velFilter[wheel][i + 1];
+  velFilter[wheel][filterNumber - 1] = linear;
+
+  float media = 0;
+  for (int i = 0; i < filterNumber; i++) media += velFilter[wheel][i];
+  return media / filterNumber;
 }
-//////////////////////////////////////////////////////////////////
-void callback(char* topic, byte* payload, unsigned int length) {
+///////////////////////////////////////////////////////////////////////////////
+void MoveWheel(int wheel, float setpoint, double output) {
+  if (setpoint == 0) {
+    analogWrite(motorFrwd[wheel], 0);
+    analogWrite(motorBkwd[wheel], 0);
+    return;
+  }
+  int pwm = (int)output;
+  if (pwm < 0) pwm = 0;
+  if (pwm > MOTOR_MAX_PWM) pwm = MOTOR_MAX_PWM;
+
+  if (setpoint > 0) {
+    analogWrite(motorBkwd[wheel], 0);
+    analogWrite(motorFrwd[wheel], pwm);
+  }
+  else {
+    analogWrite(motorFrwd[wheel], 0);
+    analogWrite(motorBkwd[wheel], pwm);
+  }
+}
+
+///////////////////////////////// NETWORK TASK /////////////////////////////////
+
+void NetworkTask(void *parameter) {
+  unsigned long lastLedTime = 0;
+
+  for (;;) {
+    if ((WiFi.status() != WL_CONNECTED) || (WiFi.localIP().toString() == "0.0.0.0")) {
+      internetConnected = 0;
+    }
+    else {
+      internetConnected = 1;
+    }
+
+    if (!client.connected()) reconnect();
+    client.loop();
+    PublishTelemetry();
+
+    if (millis() - lastLedTime >= 330) {
+      LedStatus();
+      lastLedTime = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));   // yield; incoming messages are read within 2 ms
+  }
+}
+///////////////////////////////////////////////////////////////////////////////
+// Empties the telemetry queue into MQTT packets of TELEM_BATCH rows.
+void PublishTelemetry() {
+  TelemSample sample;
+
+  while (telemQueue != NULL && xQueueReceive(telemQueue, &sample, 0) == pdTRUE) {
+    char row[128];
+    int n = snprintf(row, sizeof(row),
+                     "%lu,%lu,%.2f,%.2f,%.1f,%.2f,%.2f,%.1f,%.2f,%.2f,%.1f\n",
+                     (unsigned long)sample.seq, (unsigned long)sample.t_ms,
+                     sample.set[0], sample.vel[0], sample.pwm[0],
+                     sample.set[1], sample.vel[1], sample.pwm[1],
+                     sample.set[2], sample.vel[2], sample.pwm[2]);
+    if (n <= 0) continue;
+    if (n >= (int)sizeof(row)) n = sizeof(row) - 1;    // snprintf truncated the row
+
+    if (telemetryToSerial) Serial.print(row);
+    if (!telemetryEnabled) continue;
+
+    if (telemLen + n >= (int)sizeof(telemPayload) - 1) FlushTelemetry();
+    memcpy(telemPayload + telemLen, row, n);
+    telemLen += n;
+    telemPayload[telemLen] = 0;
+    telemRows++;
+    if (telemRows >= TELEM_BATCH) FlushTelemetry();
+  }
+
+  if (telemRows > 0 && (millis() - telemLastFlush) >= TELEM_MAX_AGE) FlushTelemetry();
+}
+///////////////////////////////////////////////////////////////////////////////
+void FlushTelemetry() {
+  telemLastFlush = millis();
+  if (telemLen == 0) return;
+
+  // dropping the batch is fine, the control task is not waiting for it
+  if (!client.connected() ||
+      !client.publish(telemetryTopic, (uint8_t *)telemPayload, telemLen, false)) {
+    telemDropped += telemRows;
+  }
+  telemLen = 0;
+  telemRows = 0;
+
+  if (telemDropped > 0 && (millis() - telemLastWarn) >= 5000) {
+    telemLastWarn = millis();
+    Serial.print("Telemetry samples dropped so far: "); Serial.println(telemDropped);
+  }
+}
+///////////////////////////////////////////////////////////////////////////////
+void callback(char *topic, byte *payload, unsigned int length) {
   // telemetry control channel: "1"/"0" start-stop the MQTT stream,
   // "s1"/"s0" start-stop the copy printed on the USB serial port
   if (strcmp(topic, telemetryCtrlTopic) == 0) {
@@ -300,313 +419,88 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
     return;
   }
-  //Serial.print("Message arrived on topic: ");
-  //Serial.println(topic);
-  //Serial.print("Message: ");
-  //String inMessage;
-  char message[200]=" ";
-  if (length > sizeof(message) - 1) length = sizeof(message) - 1;  // keep the copy inside the buffer
-  for (int i = 0; i < length; i++) {
-    //Serial.print((char)payload[i]);
-    //inMessage+=(char)payload[i];
-    message[i]=(char)payload[i];
-  }
-  //Serial.println("");
-  
-  byte index = 0;
-  ptr = strtok(message, ",");  // delimiter
-  while (ptr != NULL)
-   {
-      strings[index] = ptr;
-      index++;
-      ptr = strtok(NULL, ",");
-   }
-  for (int n = 0; n < index; n++)
-   {
-      //Serial.print(n);
-      //Serial.print("  ");
-      //Serial.println(strings[n]);
-      velocity_values[n]=atof(strings[n]);
-   }
-  Setpoint=velocity_values[0];
-  SetpointB=velocity_values[1];
-  SetpointC=velocity_values[2];
-  absSetpointA = abs(Setpoint);
-  absSetpointB = abs(SetpointB);
-  absSetpointC = abs(SetpointC);
-}
-////////////////////////////////////////////////////////////////////////////
-void reconnect() {
-   int8_t ret;
 
-  // Stop if already connected.
+  // "<velA>,<velB>,<velC>" in cm/s
+  char message[64];
+  if (length >= sizeof(message)) length = sizeof(message) - 1;
+  memcpy(message, payload, length);
+  message[length] = 0;
+
+  float values[3] = {0, 0, 0};
+  int index = 0;
+  char *ptr = strtok(message, ",");
+  while (ptr != NULL && index < 3) {
+    values[index++] = atof(ptr);
+    ptr = strtok(NULL, ",");
+  }
+  if (index < 3) return;   // ignore a truncated message instead of driving on it
+
+  portENTER_CRITICAL(&setpointMux);
+  setpointCmd[0] = values[0];
+  setpointCmd[1] = values[1];
+  setpointCmd[2] = values[2];
+  portEXIT_CRITICAL(&setpointMux);
+}
+///////////////////////////////////////////////////////////////////////////////
+// Non blocking: one attempt every 2 s. The wheels keep running while the broker
+// is away and a failure never restarts the board.
+void reconnect() {
   if (client.connected()) {
     mqttConnected = 1;
     return;
   }
+  mqttConnected = 0;
+  if (millis() - lastReconnectAttempt < 2000) return;
+  lastReconnectAttempt = millis();
 
   Serial.print("Connecting to MQTT... ");
-
-  uint8_t retries = 15;
-  while (!client.connected()) {// connect will return 0 for connected
-         
-       if (client.connect("ESP32_clientID")) {
-          mqttConnected = 1;
-          LedStatus();
-          Serial.println("connected");
-          // Once connected, publish an announcement...
-          client.publish("DriverCheck", "OK");
-          // ... and resubscribe
-          client.subscribe("motor_velocities");
-          client.subscribe(telemetryCtrlTopic);
-          // re-send the CSV header so a logger started later still knows the columns
-          client.publish(telemetryTopic, telemHeader);
-          telemLen = 0;
-          telemRows = 0;
-        }
-        else {
-          mqttConnected = 0;
-          Serial.println("Retrying MQTT connection in 2 seconds...");
-          LedStatus();
-          delay(500);  // wait 2 seconds         
-          retries--;
-          if (retries == 0) {
-            // basically die and wait for WDT to reset me
-            //wm.resetSettings();
-            break;
-          }        
-        }       
-      }     
-  if (!client.connected()) {
-      Serial.println("Failed to connect MQTT - restarting ESP!");      
-      ESP.restart();
+  if (client.connect("ESP32_clientID")) {
+    mqttConnected = 1;
+    Serial.println("connected");
+    client.publish("DriverCheck", "OK");
+    client.subscribe(velocityTopic);
+    client.subscribe(telemetryCtrlTopic);
+    // the header tells a logger started later what the columns are
+    client.publish(telemetryTopic, telemHeader);
+    telemLen = 0;
+    telemRows = 0;
+    LedStatus();
   }
   else {
-      mqttConnected = 1;
-      Serial.println("connected**");
-      
+    Serial.println("failed, retrying in 2 seconds");
   }
 }
-///////////////////////////////////////////////////////////////////////
-void MoveWheels(int a, int b, int c)
-{
-  if (Setpoint >= 0)
-  {
-    if (Setpoint == 0)
-    { analogWrite(motorBkwdA, 0); analogWrite(motorFrwdA, 0);
-      myPID.SetMode(MANUAL);
-      Output = 0;
-      myPID.SetMode(AUTOMATIC); }
-    else{
-    analogWrite(motorBkwdA, 0);
-    analogWrite(motorFrwdA, 0);
-    analogWrite(motorFrwdA, a);}
-    
-  }
-  else 
-  {
-    analogWrite(motorFrwdA, 0); 
-    analogWrite(motorBkwdA, 0); 
-    analogWrite(motorBkwdA, a);
-       
-  }
-  if (SetpointB >= 0)
-  {
-    if (SetpointB == 0)
-    { analogWrite(motorBkwdB, 0); analogWrite(motorFrwdB, 0);
-      myPIDB.SetMode(MANUAL);
-      OutputB = 0;
-      myPIDB.SetMode(AUTOMATIC); }
-    else{
-      analogWrite(motorBkwdB, 0);
-      analogWrite(motorFrwdB, 0);
-      analogWrite(motorFrwdB, b);}
-    
-  }
-  else 
-  {
-    analogWrite(motorFrwdB, 0); 
-    analogWrite(motorBkwdB, 0); 
-    analogWrite(motorBkwdB, b);       
-  }
-  if (SetpointC >= 0)
-  {
-    if (SetpointC == 0)
-    {   analogWrite(motorBkwdC, 0); analogWrite(motorFrwdC, 0);
-      myPIDC.SetMode(MANUAL);
-      OutputC = 0;
-      myPIDC.SetMode(AUTOMATIC);}
-    else{
-        analogWrite(motorBkwdC, 0);
-        analogWrite(motorFrwdC, 0);
-        analogWrite(motorFrwdC, c);}
-    
-  }
-  else 
-  {
-    analogWrite(motorFrwdC, 0); 
-    analogWrite(motorBkwdC, 0); 
-    analogWrite(motorBkwdC, c);
-       
-  }
-
+///////////////////////////////////////////////////////////////////////////////
+void saveParamCallback() {
+  Serial.println("[CALLBACK] saveParamCallback fired");
+  String server_temp = getParam("mqtt_server");
+  String port_temp = getParam("mqtt_port");
+  server_temp.toCharArray(mqtt_server, server_temp.length() + 1);
+  port_temp.toCharArray(mqtt_port, port_temp.length() + 1);
+  Serial.print("PARAM mqtt_server = " + server_temp);
+  Serial.println("PARAM mqtt_port = " + port_temp);
 }
-////////////////////////////////////////////////////////////////////////
-//////////////////////CALCULATE_VELOCITY///////////////////////////
-
-float CalcVelocity (int motorLabel)
-{
-
-  if (motorLabel==1){
-    Encodervalue = EncodervalueA;
-    LastEncodervalue = LastEncodervalueA;  
-    unsigned long nowA = micros();
-    dtSec = (nowA - lastCalcTimeA) / 1000000.0;
-    lastCalcTimeA = nowA;
-    for(int i=0; i < filterNumber; i++)
-    {
-      velVect[i]=velVectA[i];
-    }
-  }
-  if (motorLabel==2){
-    Encodervalue = EncodervalueB;
-    LastEncodervalue = LastEncodervalueB;  
-    unsigned long nowB = micros();
-    dtSec = (nowB - lastCalcTimeB) / 1000000.0;
-    lastCalcTimeB = nowB;
-    for(int i=0; i < filterNumber; i++)
-    {
-      velVect[i]=velVectB[i];
-    }
-  }
-  if (motorLabel==3){
-    Encodervalue = EncodervalueC;
-    LastEncodervalue = LastEncodervalueC;  
-    unsigned long nowC = micros();
-    dtSec = (nowC - lastCalcTimeC) / 1000000.0;
-    lastCalcTimeC = nowC;
-    for(int i=0; i < filterNumber; i++)
-    {
-      velVect[i]=velVectC[i];
-    }
-  }
-
-  float media = 0 ;
-  DeltaEncodervalue = Encodervalue - LastEncodervalue;
-  // the loop is not exactly periodic (WiFi, MQTT), so use the measured window
-  if (dtSec <= 0.0 || dtSec > 0.5) dtSec = sampleTime / 1000.0;   // first call, or a stall
-  freqA = DeltaEncodervalue / dtSec;
-  wA = ((2*3.141596)/N)*freqA;
-  vA = (diam/2)*wA;
-  for (int i = 0 ; i < filterNumber -1; i++){
-      velVect[i] = velVect[i+1];
-  }
-  velVect[filterNumber -1 ] = wA;
-  for (int i = 0 ; i < filterNumber ; i++){
-      media+= velVect[i];
-  }
-  media = media/filterNumber;
-  //velVect[filterNumber -1 ] = media;
-  
-  if (motorLabel==1){
-    for(int i=0; i < filterNumber; i++)
-    {
-      velVectA[i]=velVect[i];      
-    }
-    LastEncodervalueA = Encodervalue;
-  }
-  if (motorLabel==2){
-    for(int i=0; i < filterNumber; i++)
-    {
-      velVectB[i]=velVect[i];      
-    }
-    LastEncodervalueB = Encodervalue;
-  }
-  if (motorLabel==3){
-    for(int i=0; i < filterNumber; i++)
-    {
-      velVectC[i]=velVect[i];      
-    }
-    LastEncodervalueC = Encodervalue;
-  }
-  return (media);
-
+///////////////////////////////////////////////////////////////////////////////
+String getParam(String name) {
+  //read parameter from server, for customhmtl input
+  String value;
+  if (name == "mqtt_server") value = custom_mqtt_server.getValue();
+  else { if (name == "mqtt_port") value = custom_mqtt_port.getValue(); }
+  return value;
 }
-
-/////////////////////////////////////////////////////////////////////////
-
-void LedStatus()
-{
-  if ((internetConnected >= 1) && (mqttConnected >= 1 )) 
-  {
-    if(ledChk < 3 )
-    {
+///////////////////////////////////////////////////////////////////////////////
+void LedStatus() {
+  if ((internetConnected >= 1) && (mqttConnected >= 1)) {
+    if (ledChk < 3) {
       digitalWrite(ledPin, LOW);
       ledChk++;
     }
-    if(ledChk >= 3 )
-    {
+    if (ledChk >= 3) {
       digitalWrite(ledPin, HIGH);
-      ledChk=0;
+      ledChk = 0;
     }
-    
   }
-  if ((internetConnected==1) &&(mqttConnected == 0 )) 
-  {
+  if ((internetConnected == 1) && (mqttConnected == 0)) {
     digitalWrite(ledPin, !digitalRead(ledPin));
   }
-  
-}
-
-/////////////////////////////////////////////////////////////////////////
-////////////////////////TELEMETRY / VELOCITY LOG/////////////////////////
-// One CSV row per control cycle:
-//   seq,t_ms,setA,velA,pwmA,setB,velB,pwmB,setC,velC,pwmC
-// velX is the filtered angular velocity in rad/s (signed, from the encoders),
-// setX is the commanded velocity, pwmX is the PID output signed by the
-// commanded direction, so the response can be plotted straight from the log.
-
-void LogVelocities()
-{
-  if (!telemetryEnabled && !telemetryToSerial) return;
-
-  char row[112];
-  int n = snprintf(row, sizeof(row),
-                   "%lu,%lu,%.3f,%.3f,%.1f,%.3f,%.3f,%.1f,%.3f,%.3f,%.1f\n",
-                   (unsigned long)telemSeq, (unsigned long)millis(),
-                   Setpoint,  (double)velA, (Setpoint  < 0 ? -Output  : Output),
-                   SetpointB, (double)velB, (SetpointB < 0 ? -OutputB : OutputB),
-                   SetpointC, (double)velC, (SetpointC < 0 ? -OutputC : OutputC));
-  telemSeq++;
-  if (n <= 0) return;
-  if (n >= (int)sizeof(row)) n = sizeof(row) - 1;   // snprintf truncated the row
-
-  if (telemetryToSerial) Serial.print(row);
-  if (!telemetryEnabled) return;
-
-  // flush first if this row would not fit in the packet buffer
-  if (telemLen + n >= (int)sizeof(telemPayload) - 1) FlushTelemetry();
-
-  memcpy(telemPayload + telemLen, row, n);
-  telemLen += n;
-  telemPayload[telemLen] = '\0';
-  telemRows++;
-
-}
-/////////////////////////////////////////////////////////////////////////
-void FlushTelemetry()
-{
-  telemLastFlush = millis();
-  if (telemLen == 0) return;
-
-  // drop the batch rather than block the control loop if MQTT is down
-  if (!client.connected() || !client.publish(telemetryTopic, (uint8_t *)telemPayload, telemLen, false)) {
-    telemDropped += telemRows;
-    if (millis() - telemLastWarn >= 5000) {   // do not flood the serial port
-      telemLastWarn = millis();
-      Serial.print("Telemetry rows dropped so far: "); Serial.println(telemDropped);
-    }
-  }
-  telemLen = 0;
-  telemRows = 0;
 }

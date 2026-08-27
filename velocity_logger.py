@@ -6,8 +6,8 @@ The sketch publishes CSV rows on the topic "motor_telemetry":
 
     seq   row counter produced by the ESP32 (used here to detect lost packets)
     t_ms  millis() on the ESP32 when the sample was taken
-    setX  commanded angular velocity  [rad/s]
-    velX  measured angular velocity   [rad/s], filtered, signed
+    setX  commanded wheel linear velocity  [cm/s]
+    velX  measured wheel linear velocity   [cm/s], filtered, signed
     pwmX  PID output, signed by the commanded direction  [0-255]
 
 Usage
@@ -64,7 +64,7 @@ class Recorder:
         self.t0 = time.time()
 
     def feed(self, payload):
-        # one MQTT message carries a batch of rows, one row per control cycle
+        # one MQTT message carries a batch of rows sampled by the control task
         for line in payload.decode("utf-8", "replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):   # header line republished on reconnect
@@ -163,8 +163,8 @@ def plot(path):
 
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
     for ax, wheel in zip(axes, ("A", "B", "C")):
-        ax.plot(t, data["set" + wheel], label="setpoint [rad/s]", linestyle="--")
-        ax.plot(t, data["vel" + wheel], label="measured [rad/s]")
+        ax.plot(t, data["set" + wheel], label="setpoint [cm/s]", linestyle="--")
+        ax.plot(t, data["vel" + wheel], label="measured [cm/s]")
         ax.set_ylabel(f"wheel {wheel}")
         ax.grid(True, alpha=0.3)
         pwm = ax.twinx()                       # PID output on its own axis
