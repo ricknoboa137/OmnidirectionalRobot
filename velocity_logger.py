@@ -15,6 +15,7 @@ Usage
     python velocity_logger.py --plot              # plot the log when you stop it with Ctrl+C
     python velocity_logger.py --broker 192.168.0.110 --duration 20 --plot
     python velocity_logger.py --replay logs/velocities_2026....csv   # just plot an old log
+    python velocity_logger.py --replay logs/....csv --first 109547 --count 500
 
 Requires paho-mqtt ( pip install paho-mqtt ); plotting also needs matplotlib.
 """
@@ -45,6 +46,10 @@ def parse_args():
     p.add_argument("--duration", type=float, default=0.0, help="stop after N seconds (0 = until Ctrl+C)")
     p.add_argument("--plot", action="store_true", help="plot the log once the recording stops")
     p.add_argument("--replay", default=None, help="skip recording, just plot this CSV file")
+    p.add_argument("--first", type=int, default=None,
+                   help="plot from this sample number on (the seq column)")
+    p.add_argument("--count", type=int, default=None,
+                   help="number of samples to plot, e.g. 500 for one step response")
     return p.parse_args()
 
 ###############################################################################
@@ -142,38 +147,44 @@ def record(args):
 ###############################################################################
 
 
-def plot(path):
+# The PID output shares the velocity axis, scaled the way the original serial
+# plot did it: the normalised output times 255/10, i.e. the raw PWM over 10.
+PWM_PLOT_NORM = 255 / 10
+
+
+def plot(path, first=None, count=None):
     import matplotlib.pyplot as plt
 
     data = {c: [] for c in COLUMNS}
-    host_time = []
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
-            host_time.append(float(row["host_time"]))
             for c in COLUMNS:
                 data[c].append(float(row[c]))
 
-    if not host_time:
+    if not data["seq"]:
         print(f"{path} contains no samples")
         return
 
-    # ESP32 timebase, zeroed on the first sample, is the cleanest x axis
-    t0 = data["t_ms"][0]
-    t = [(v - t0) / 1000.0 for v in data["t_ms"]]
+    # window the log, so a step can be looked at the way the original plot did
+    start = 0
+    if first is not None:
+        seqs = data["seq"]
+        start = min(range(len(seqs)), key=lambda i: abs(seqs[i] - first))
+    end = len(data["seq"]) if count is None else min(start + count, len(data["seq"]))
+    view = {c: data[c][start:end] for c in COLUMNS}
 
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
+    ticks = view["seq"]          # sample counter, as on the original plot
+
+    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 9))
     for ax, wheel in zip(axes, ("A", "B", "C")):
-        ax.plot(t, data["set" + wheel], label="setpoint [rad/s]", linestyle="--")
-        ax.plot(t, data["vel" + wheel], label="measured [rad/s]")
+        ax.plot(ticks, view["vel" + wheel], color="blue", linewidth=1.0, label="Vel" + wheel)
+        ax.plot(ticks, view["set" + wheel], color="red", linewidth=1.0, label="SP_" + wheel)
+        ax.plot(ticks, [v / 255.0 * PWM_PLOT_NORM for v in view["pwm" + wheel]],
+                color="green", linewidth=1.0, label="Cntrl_" + wheel)
         ax.set_ylabel(f"wheel {wheel}")
         ax.grid(True, alpha=0.3)
-        pwm = ax.twinx()                       # PID output on its own axis
-        pwm.plot(t, [v / 255.0 for v in data["pwm" + wheel]], color="grey", alpha=0.5, label="PID output (norm.)")
-        pwm.set_ylabel("PWM (norm.)", color="grey", fontsize=8)
-        pwm.set_ylim(-1.05, 1.05)
-        lines = ax.get_lines() + pwm.get_lines()
-        ax.legend(lines, [l.get_label() for l in lines], loc="upper right", fontsize=8)
-    axes[-1].set_xlabel("time [s]")
+        ax.legend(loc="upper left", ncol=3, fontsize=9, frameon=False)
+    axes[-1].set_xlabel("sample count")
     axes[0].set_title(os.path.basename(path))
     fig.tight_layout()
     plt.show()
@@ -183,8 +194,8 @@ def plot(path):
 if __name__ == "__main__":
     args = parse_args()
     if args.replay:
-        plot(args.replay)
+        plot(args.replay, args.first, args.count)
     else:
         path = record(args)
         if args.plot:
-            plot(path)
+            plot(path, args.first, args.count)
