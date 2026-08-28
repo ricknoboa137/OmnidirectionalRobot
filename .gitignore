@@ -1,0 +1,24 @@
+# Paper and manuscript material - kept local, never pushed
+*.tex
+*.bib
+*.doc
+*.docx
+*.odt
+*.pdf
+*.ppt
+*.pptx
+
+# Figures and screen captures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.svg
+*.eps
+
+# Python
+__pycache__/
+*.pyc
