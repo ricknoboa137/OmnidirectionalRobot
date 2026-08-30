@@ -16,7 +16,7 @@ char *strings[3];
 float velocity_values[3]={0,0,0};
 char *ptr = NULL;
 uint32_t x=0;
-char mqtt_server[40]= "10.8.9.178";
+char mqtt_server[40]= "10.8.9.35";
 char mqtt_port[6] = "1883";
 
 WiFiManager wm;
@@ -235,7 +235,7 @@ void loop() {
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
   LogVelocities();   // stream velA/velB/velC (+ setpoints and PWM) back to the host
-  //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
+  Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(0);
   //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
   //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
   //Serial.println(vA);
