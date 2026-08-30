@@ -40,7 +40,7 @@ COLUMNS = ["seq", "t_ms",
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--broker", default="192.168.0.153", help="MQTT broker IP")
+    p.add_argument("--broker", default="10.8.9.178", help="MQTT broker IP")
     p.add_argument("--port", type=int, default=1883, help="MQTT broker port")
     p.add_argument("--out", default=None, help="output CSV file (default: logs/velocities_<timestamp>.csv)")
     p.add_argument("--duration", type=float, default=0.0, help="stop after N seconds (0 = until Ctrl+C)")

@@ -16,7 +16,7 @@ char *strings[3];
 float velocity_values[3]={0,0,0};
 char *ptr = NULL;
 uint32_t x=0;
-char mqtt_server[40]= "192.168.0.109";
+char mqtt_server[40]= "10.8.9.178";
 char mqtt_port[6] = "1883";
 
 WiFiManager wm;
