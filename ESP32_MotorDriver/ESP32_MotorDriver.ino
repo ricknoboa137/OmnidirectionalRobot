@@ -1,3 +1,11 @@
+// Motor driver used to repeat the original velocity controller experiment.
+// The control law is the ORIGINAL one, unchanged: the PID keeps the library
+// default 100 ms sample time and the default 0-255 output limits, and the
+// velocity is computed over the nominal sampleTime window. The only addition
+// is the telemetry that records the same three signals that used to be
+// printed on the serial port, so the run can be logged and plotted.
+// The single line that is not from the original firmware is the
+// WiFi.setSleep(false) call in setup(), marked below.
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -27,8 +35,6 @@ volatile long EncodervalueC=0, LastEncodervalueC=0, DeltaEncodervalueC=0;
 volatile unsigned prevSampTimeA=0, currSampTimeA=0, deltSampTimeA=0;
 volatile unsigned prevSampTimeB=0, currSampTimeB=0, deltSampTimeB=0;
 volatile unsigned prevSampTimeC=0, currSampTimeC=0, deltSampTimeC=0;
-unsigned long lastCalcTimeA=0, lastCalcTimeB=0, lastCalcTimeC=0;
-double dtSec=0;
 float velVect[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
 float velVectA[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
 float velVectB[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} ;
@@ -47,22 +53,6 @@ double Setpoint, Input, Output;
 double SetpointB, InputB, OutputB;
 double SetpointC, InputC, OutputC;
 double absSetpointA, absSetpointB, absSetpointC;
-// PWM range handed to the motors. MOTOR_MIN_PWM is the duty at which the wheel
-// actually starts turning under load: below it the motor only buzzes, so the
-// integral term used to have to climb through that dead zone on every new
-// command, which is what made the wheels take so long to start. Keeping it as
-// the lower output limit means the PID never sits below the point where the
-// motor moves. Calibrate it once: command a very small velocity and raise the
-// value until the wheels start without hesitating.
-const int MOTOR_MIN_PWM = 60;
-const int MOTOR_MAX_PWM = 255;
-// Units of the setpoints published on "motor_velocities".
-// practice1.ipynb divides the wheel linear velocity by the wheel radius before
-// publishing, so what arrives is the wheel ANGULAR velocity in rad/s, which is
-// what the encoders measure directly -> SETPOINT_SCALE = 1.0.
-// If the host is changed to publish the wheel LINEAR velocity in cm/s instead,
-// set SETPOINT_SCALE to the wheel radius in cm (the host kinematics use 5.8/2).
-const double SETPOINT_SCALE = 1.0;   // rad/s ; use 2.9 for cm/s
 double Kp=4.0, Ki= 23, Kd=0.012;
 PID myPID(&Input, &Output, &absSetpointA, Kp, Ki, Kd, DIRECT);
 PID myPIDB(&InputB, &OutputB, &absSetpointB, Kp, Ki, Kd, DIRECT);
@@ -168,9 +158,11 @@ void setup() {
     else {
         //if you get here you have connected to the WiFi    
         Serial.println("connected...yeey :):):)");
-        // the ESP32 station defaults to WIFI_PS_MIN_MODEM, so the radio only
-        // wakes on the AP beacon and incoming MQTT messages sit in the access
-        // point for up to a few hundred ms before they are delivered
+        // NOT IN THE ORIGINAL FIRMWARE. The ESP32 station defaults to
+        // WIFI_PS_MIN_MODEM, so incoming setpoints wait for the next access
+        // point beacon. This only changes when a command is delivered, not
+        // how the wheel responds to it. Comment this line out to run exactly
+        // the original firmware.
         WiFi.setSleep(false);
         internetConnected = 1;
         reconnect(); //connect MQTT        
@@ -195,15 +187,6 @@ void setup() {
     prevLedTime = millis();
     currSampTimeA = millis();
     //Setpoint = 0;
-    // the PID library defaults to a 100 ms sample time, so Compute() ignored 19
-    // out of every 20 calls and the loop reacted 100 ms late; run it at the rate
-    // the velocities are actually sampled
-    myPID.SetSampleTime(sampleTime);
-    myPIDB.SetSampleTime(sampleTime);
-    myPIDC.SetSampleTime(sampleTime);
-    myPID.SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
-    myPIDB.SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
-    myPIDC.SetOutputLimits(MOTOR_MIN_PWM, MOTOR_MAX_PWM);
     myPID.SetMode(AUTOMATIC);
     myPIDB.SetMode(AUTOMATIC);
     myPIDC.SetMode(AUTOMATIC);
@@ -244,14 +227,14 @@ void loop() {
   currSampTimeB = millis();
   velC = CalcVelocity(3);
   currSampTimeC = millis();  
-  Input  = abs(velA) * SETPOINT_SCALE;
-  InputB = abs(velB) * SETPOINT_SCALE;
-  InputC = abs(velC) * SETPOINT_SCALE;
+  Input = abs(velA);
+  InputB = abs(velB);
+  InputC = abs(velC);
   myPID.Compute();
   myPIDB.Compute();
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
-  LogVelocities();   // queue velA/velB/velC (+ setpoints and PWM) for the host
+  LogVelocities();   // stream velA/velB/velC (+ setpoints and PWM) back to the host
   //Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(",");
   //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
   //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
@@ -460,9 +443,6 @@ float CalcVelocity (int motorLabel)
   if (motorLabel==1){
     Encodervalue = EncodervalueA;
     LastEncodervalue = LastEncodervalueA;  
-    unsigned long nowA = micros();
-    dtSec = (nowA - lastCalcTimeA) / 1000000.0;
-    lastCalcTimeA = nowA;
     for(int i=0; i < filterNumber; i++)
     {
       velVect[i]=velVectA[i];
@@ -471,9 +451,6 @@ float CalcVelocity (int motorLabel)
   if (motorLabel==2){
     Encodervalue = EncodervalueB;
     LastEncodervalue = LastEncodervalueB;  
-    unsigned long nowB = micros();
-    dtSec = (nowB - lastCalcTimeB) / 1000000.0;
-    lastCalcTimeB = nowB;
     for(int i=0; i < filterNumber; i++)
     {
       velVect[i]=velVectB[i];
@@ -482,9 +459,6 @@ float CalcVelocity (int motorLabel)
   if (motorLabel==3){
     Encodervalue = EncodervalueC;
     LastEncodervalue = LastEncodervalueC;  
-    unsigned long nowC = micros();
-    dtSec = (nowC - lastCalcTimeC) / 1000000.0;
-    lastCalcTimeC = nowC;
     for(int i=0; i < filterNumber; i++)
     {
       velVect[i]=velVectC[i];
@@ -493,9 +467,7 @@ float CalcVelocity (int motorLabel)
 
   float media = 0 ;
   DeltaEncodervalue = Encodervalue - LastEncodervalue;
-  // the loop is not exactly periodic (WiFi, MQTT), so use the measured window
-  if (dtSec <= 0.0 || dtSec > 0.5) dtSec = sampleTime / 1000.0;   // first call, or a stall
-  freqA = DeltaEncodervalue / dtSec;
+  freqA = (DeltaEncodervalue*1000)/(double) sampleTime;
   wA = ((2*3.141596)/N)*freqA;
   vA = (diam/2)*wA;
   for (int i = 0 ; i < filterNumber -1; i++){
