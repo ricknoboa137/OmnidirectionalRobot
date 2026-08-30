@@ -235,7 +235,7 @@ void loop() {
   myPIDC.Compute();
   MoveWheels(Output,OutputB,OutputC);
   LogVelocities();   // stream velA/velB/velC (+ setpoints and PWM) back to the host
-  Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.print(0);
+  Serial.print(velA);Serial.print(",");Serial.print(Setpoint);Serial.print(",");Serial.print(Output/10);Serial.println(0);
   //Serial.print(velB);Serial.print(",");Serial.print(SetpointB);Serial.print(",");Serial.print(OutputB/10);Serial.print(",");
   //Serial.print(velC);Serial.print(",");Serial.print(SetpointC);Serial.print(",");Serial.print(OutputC/10);Serial.println(" ");
   //Serial.println(vA);
@@ -250,7 +250,7 @@ void saveParamCallback(){
   String server_temp = getParam("mqtt_server");
   String port_temp = getParam("mqtt_port");  
   server_temp.toCharArray(mqtt_server, server_temp.length() + 1);
-  port_temp.toCharArray(mqtt_port, port_temp.length() + 1);
+  port_temp.toCharArray(mqtt_port, port_temp.length() + 1); 
   Serial.print("PARAM mqtt_server = " + server_temp );
   Serial.println("PARAM mqtt_port = " +  port_temp);
 
