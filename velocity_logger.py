@@ -50,6 +50,9 @@ def parse_args():
                    help="plot from this sample number on (the seq column)")
     p.add_argument("--count", type=int, default=None,
                    help="number of samples to plot, e.g. 500 for one step response")
+    p.add_argument("--lines", action="store_true",
+                   help="join the samples with straight lines instead of holding "
+                        "each value until the next sample")
     return p.parse_args()
 
 ###############################################################################
@@ -152,8 +155,13 @@ def record(args):
 PWM_PLOT_NORM = 255 / 10
 
 
-def plot(path, first=None, count=None):
+def plot(path, first=None, count=None, lines=False):
     import matplotlib.pyplot as plt
+
+    # Every value is held until the next sample is taken, so the samples are
+    # drawn as a zero order hold. Joining them with straight lines would show
+    # intermediate values that were never measured or commanded.
+    style = "default" if lines else "steps-post"
 
     data = {c: [] for c in COLUMNS}
     with open(path, newline="") as f:
@@ -177,10 +185,12 @@ def plot(path, first=None, count=None):
 
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 9))
     for ax, wheel in zip(axes, ("A", "B", "C")):
-        ax.plot(ticks, view["vel" + wheel], color="blue", linewidth=1.0, label="Vel" + wheel)
-        ax.plot(ticks, view["set" + wheel], color="red", linewidth=1.0, label="SP_" + wheel)
+        ax.plot(ticks, view["vel" + wheel], color="blue", linewidth=1.0,
+                drawstyle=style, label="Vel" + wheel)
+        ax.plot(ticks, view["set" + wheel], color="red", linewidth=1.0,
+                drawstyle=style, label="SP_" + wheel)
         ax.plot(ticks, [v / 255.0 * PWM_PLOT_NORM for v in view["pwm" + wheel]],
-                color="green", linewidth=1.0, label="Cntrl_" + wheel)
+                color="green", linewidth=1.0, drawstyle=style, label="Cntrl_" + wheel)
         ax.set_ylabel(f"wheel {wheel}")
         ax.grid(True, alpha=0.3)
         ax.legend(loc="upper left", ncol=3, fontsize=9, frameon=False)
@@ -194,8 +204,8 @@ def plot(path, first=None, count=None):
 if __name__ == "__main__":
     args = parse_args()
     if args.replay:
-        plot(args.replay, args.first, args.count)
+        plot(args.replay, args.first, args.count, args.lines)
     else:
         path = record(args)
         if args.plot:
-            plot(path, args.first, args.count)
+            plot(path, args.first, args.count, args.lines)
