@@ -9,7 +9,9 @@ import json
 import time
 import random
 import pyqtgraph as pg
+#from pyqtgraph.widgets.RemoteGraphicsView import RemoteGraphicsView
 from pyqtgraph.Qt import QtGui, QtCore
+from PyQt5 import QtWidgets  
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -42,10 +44,10 @@ class Graph:
         self.num_points = self.window_size * self.sampling_rate
         self.MAX_DATA_POINTS = self.num_points//2
         self.loaded_model=loaded_model
-        self.app = QtGui.QApplication([])
-        self.win = pg.GraphicsWindow(title='Mindrove Plot',size=(800, 600))
+        self.app = QtWidgets.QApplication([])
+        self.win = pg.GraphicsLayoutWidget(show=True,title='Mindrove Plot',size=(800, 600))
         
-        self.broker = '192.168.0.174'
+        self.broker = '192.168.4.2' #192.168.0.174  192.168.89.27
         self.port = 1883
         self.topic = "gamepad/joystick"
         self.client_id = f'python-mqtt-{random.randint(0, 1000)}'
@@ -61,7 +63,7 @@ class Graph:
         timer = QtCore.QTimer()
         timer.timeout.connect(self.update)
         timer.start(self.update_speed_ms)
-        QtGui.QApplication.instance().exec_()
+        QtWidgets.QApplication.instance().exec_()
         
         
 
@@ -202,13 +204,13 @@ def main():
     params = MindRoveInputParams()
     
     
-    model_path = 'D:\DoctoralSchool\Telepresence Toolkit\ArmBandConnection\Models\LSTM_model_04.h5' 
-    loaded_model = tf.keras.models.load_model(model_path) #, custom_objects=custom_objects
-    print(f"Model loaded successfully from {model_path}")
-    loaded_model.summary()
+    
 
     try:
-        
+        model_path = 'LSTM_model_04.keras' 
+        loaded_model = tf.keras.models.load_model(model_path) #, custom_objects=custom_objects
+        print(f"Model loaded successfully from {model_path}")
+        loaded_model.summary()
         board_shim = BoardShim(BoardIds.MINDROVE_WIFI_BOARD, params)
         board_shim.prepare_session()
         board_shim.start_stream()
